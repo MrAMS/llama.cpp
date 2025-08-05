@@ -14,7 +14,7 @@ const void* loadModel() {
     NSFileManager *fileManager = [NSFileManager defaultManager];
     // 获取应用的 Documents 目录的 URL
     NSURL *documentsURL = [[fileManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask] firstObject];
-    NSString *pathString = [documentsURL.absoluteString stringByAppendingString:@"ane_minicpm4v3b_vision_f16_b1.mlmodelc"];
+    NSString *pathString = [documentsURL.absoluteString stringByAppendingString:@"ane_minicpmv4_vit_f16.mlmodelc"];
     NSURL *modelURL = [NSURL URLWithString:pathString];
 
     NSLog(modelURL.absoluteString);
