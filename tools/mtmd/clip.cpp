@@ -3190,11 +3190,7 @@ struct llava_uhd {
         bool has_slices    = original_size.width > slice_size || original_size.height > slice_size;
         const bool has_pinpoints = !ctx->model.hparams.image_res_candidates.empty();
 
-<<<<<<< HEAD
         if (minicpmv_video_mode) has_slices = false;
-=======
-        // has_slices = false;
->>>>>>> origin/tmp_project_i
         if (!has_slices) {
             // skip slicing logic
             res.overview_size = clip_image_size{slice_size, slice_size};
