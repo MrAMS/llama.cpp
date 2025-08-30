@@ -20,13 +20,13 @@ if(APPLE)
     target_sources(mtmd PRIVATE
         ane/ane.h
         ane/ane.mm
-        ane/ane_minicpmv4_vit_f16.h
-        ane/ane_minicpmv4_vit_f16.m
+        ane/coreml_minicpmv45_vit_f16.h
+        ane/coreml_minicpmv45_vit_f16.m
     )
     
     # Enable ARC for Objective-C files
     set_source_files_properties(ane/ane.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
-    set_source_files_properties(ane/ane_minicpmv4_vit_f16.m PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set_source_files_properties(ane/coreml_minicpmv45_vit_f16.m PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 endif()
 
 target_link_libraries     (mtmd PUBLIC ggml llama common)

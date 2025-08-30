@@ -7,8 +7,19 @@ void example_multiple_images_progressive() {
     mtmd_ios_params params = mtmd_ios_params_default();
     params.model_path = "/Users/tianchi/code/tc_mb/deployment/gguf/MiniCPM-V-4-gguf/ggml-model-Q4_0.gguf";
     params.mmproj_path = "/Users/tianchi/code/tc_mb/deployment/gguf/MiniCPM-V-4-gguf/mmproj-model-f16.gguf";
+    // params.model_path = "/Users/guoqining/Desktop/ios_0805/public/ggufs/v4/ggml-model-Q4_0.gguf";
+    // params.mmproj_path = "/Users/guoqining/Desktop/ios_0805/public/ggufs/v4/mmproj-model-f16.gguf";
+    params.model_path = "/Users/guoqining/Desktop/ios_0805/public/ggufs/v4_5/Model-8.2B-Q6_K.gguf";
+    params.mmproj_path = "/Users/guoqining/Desktop/ios_0805/public/ggufs/v4_5/mmproj-model-f16.gguf";
+    // params.model_path = "/Users/guoqining/Desktop/ios_0805/public/ggufs/Model-8.2B-Q4_0.gguf";
+    // params.mmproj_path = "/Users/guoqining/Desktop/ios_0805/public/ggufs/mmproj-model-f16.gguf";
     params.n_predict = 100;  // 增加生成长度
-    params.temperature = 0.6f;
+    params.temperature = 0.7f;
+    params.n_ctx = 4096;
+    params.n_threads = 4;
+    params.use_gpu = true;
+    params.mmproj_use_gpu = true;
+    params.warmup = true;
     
     mtmd_ios_context* ctx = mtmd_ios_init(&params);
     if (!ctx) {

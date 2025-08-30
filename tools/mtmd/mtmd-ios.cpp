@@ -69,7 +69,10 @@ mtmd_ios_params mtmd_ios_params_default(void) {
     return params;
 }
 
+static int cnt = 0;
+
 mtmd_ios_context* mtmd_ios_init(const mtmd_ios_params* params) {
+    cnt = 0;
     if (!params || params->model_path.empty() || params->mmproj_path.empty()) {
         return nullptr;
     }
@@ -91,6 +94,10 @@ mtmd_ios_context* mtmd_ios_init(const mtmd_ios_params* params) {
     common_params.cpuparams.n_threads = params->n_threads;
     common_params.sampling.temp = params->temperature;
     common_params.mmproj_use_gpu = params->mmproj_use_gpu;
+
+    common_params.sampling.penalty_repeat = 1.05;
+    common_params.sampling.top_k = 100;
+    common_params.sampling.top_p = 0.8;
 
     ctx->llama_init = common_init_from_params(common_params);
     
@@ -162,7 +169,19 @@ int mtmd_ios_prefill_image(mtmd_ios_context* ctx, const std::string& image_path)
     ctx->bitmaps.entries.push_back(std::move(bmp));
     
     mtmd_input_text text;
-    text.text = mtmd_default_marker();
+    std::string txt = "<|im_start|>user\n<image>";
+    if (cnt == 1) {
+        txt = "<image>";
+        cnt = 0;
+    }
+    cnt = 1;
+    const std::string placeholder = "<image>";
+    size_t pos = txt.find(placeholder);
+    if (pos != std::string::npos) {
+        txt.replace(pos, placeholder.length(), mtmd_default_marker());
+    }
+    printf("\n%s\n\n", txt.c_str());
+    text.text = txt.c_str();
     text.add_special = ctx->n_past == 0;
     text.parse_special = true;
     
@@ -198,6 +217,62 @@ int mtmd_ios_prefill_image(mtmd_ios_context* ctx, const std::string& image_path)
     return 0;
 }
 
+int mtmd_ios_prefill_frame(mtmd_ios_context* ctx, const std::string& image_path) {
+
+    if (!ctx || image_path.empty()) {
+        return -1;
+    }
+    
+    mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_file(ctx->ctx_vision.get(), image_path.c_str()));
+    if (!bmp.ptr) {
+        set_error(ctx, "Failed to load image from file: " + image_path);
+        return -1;
+    }
+    ctx->bitmaps.entries.push_back(std::move(bmp));
+    
+    mtmd_input_text text;
+    std::string txt = "<|im_start|>user\n<image>";
+    const std::string placeholder = "<image>";
+    size_t pos = txt.find(placeholder);
+    if (pos != std::string::npos) {
+        txt.replace(pos, placeholder.length(), mtmd_default_marker());
+    }
+    printf("\n%s\n\n", txt.c_str());
+    text.text = txt.c_str();
+    text.add_special = ctx->n_past == 0;
+    text.parse_special = true;
+    
+    mtmd::input_chunks chunks(mtmd_input_chunks_init());
+    auto bitmaps_c_ptr = ctx->bitmaps.c_ptr();
+    int32_t res = mtmd_tokenize_video(ctx->ctx_vision.get(),
+                        chunks.ptr.get(),
+                        &text,
+                        bitmaps_c_ptr.data(),
+                        bitmaps_c_ptr.size());
+    if (res != 0) {
+        set_error(ctx, "Failed to tokenize image");
+        return -1;
+    }
+    
+    ctx->bitmaps.entries.clear();
+    
+    llama_pos new_n_past;
+    if (mtmd_helper_eval_chunks(ctx->ctx_vision.get(),
+                ctx->lctx,
+                chunks.ptr.get(),
+                ctx->n_past,
+                0,
+                1024,
+                false,
+                &new_n_past)) {
+        set_error(ctx, "Failed to eval image");
+        return -1;
+    }
+    
+    ctx->n_past = new_n_past;
+    
+    return 0;
+}
 
 
 int mtmd_ios_prefill_text(mtmd_ios_context* ctx, const std::string& text, const std::string& role) {
@@ -211,12 +286,15 @@ int mtmd_ios_prefill_text(mtmd_ios_context* ctx, const std::string& text, const 
     
     common_chat_templates_inputs tmpl_inputs;
     tmpl_inputs.messages = {msg};
-    tmpl_inputs.add_generation_prompt = false;
+    tmpl_inputs.add_generation_prompt = true;
     tmpl_inputs.use_jinja = false;
     auto formatted_chat = common_chat_templates_apply(ctx->tmpls.get(), tmpl_inputs);
     
     mtmd_input_text input_text;
-    input_text.text = formatted_chat.prompt.c_str();
+    std::string txt = formatted_chat.prompt.erase(0, sizeof("<|im_start|>user\n") - 1);
+    // txt += "<think>\n\n</think>\n";
+    input_text.text = txt.c_str();
+    printf("\n%s\n\n", input_text.text);
     input_text.add_special = ctx->n_past == 0;
     input_text.parse_special = true;
     
