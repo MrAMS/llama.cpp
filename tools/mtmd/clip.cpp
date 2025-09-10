@@ -10,8 +10,14 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "gguf.h"
-#if defined(ENABLE_COREML)
-#include "coreml/mtmd_coreml.h"
+#if defined(ENABLE_TRT)
+#include <NvInfer.h>
+#include <NvInferVersion.h>
+#include <cuda_runtime_api.h>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 #endif
 
 #include <cassert>
@@ -392,8 +398,8 @@ struct clip_ctx {
     bool debug_graph = false;
     std::vector<ggml_tensor *> debug_print_tensors;
     
-    // CoreML model path for iOS
-    std::string coreml_model_path;
+    // TensorRT engine path (for MiniCPMV TRT encoder)
+    std::string trt_engine_path;
 
     clip_ctx(clip_context_params & ctx_params) {
         debug_graph = std::getenv("MTMD_DEBUG_GRAPH") != nullptr;
@@ -2249,6 +2255,8 @@ struct clip_model_loader {
                         hparams.minicpmv_query_num = 64;
                     } else if (hparams.minicpmv_version == 5) {
                         hparams.minicpmv_query_num = 64;
+                    } else if (hparams.minicpmv_version == 6) {
+                        hparams.minicpmv_query_num = 64;
                     } else {
                         hparams.minicpmv_query_num = 96;
                     }
@@ -3685,6 +3693,8 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
                     } else if (params.minicpmv_version == 5) {
                         // MiniCPM-V 4.0
                         n_patches_sq = 64;
+                    } else if (params.minicpmv_version == 6) {
+                        n_patches_sq = 64;
                     } else {
                         GGML_ABORT("Unknown minicpmv version");
                     }
@@ -3838,31 +3848,107 @@ static std::vector<std::vector<float>> get_2d_sincos_pos_embed(int embed_dim, co
     return pos_embed_2d;
 }
 
-#if defined(ENABLE_COREML)
-// forward declarations
+#if defined(ENABLE_TRT)
+// Common TensorRT smart-pointer deleter compatible with TRT 8/9 (destroy()) and TRT 10 (delete)
+template <typename T>
+struct TrtDeleterGlobal {
+    void operator()(T* p) const noexcept {
+#if defined(NV_TENSORRT_MAJOR) && (NV_TENSORRT_MAJOR >= 10)
+        delete p;
+#else
+        if (p) p->destroy();
+#endif
+    }
+};
+// forward declarations kept (names unchanged per user request)
 static bool coreml_embedding(clip_ctx * ctx, const int n_threads, const clip_image_f32_batch * imgs_c_ptr, float * vec);
 static bool coreml_resampler(clip_ctx * ctx, const int n_threads, const clip_image_f32_batch * imgs_c_ptr, const float * vit_embedding, float * vec);
 
-static bool clip_image_encode_coreml(float * data, float * vec, const char* coreml_model_path) {
-
-    static int flag = 0;
-    static const void* coremlEncoder = NULL;
-    static std::string cached_model_path = "";
-    
-    // Check if we need to load a new model
-    if (flag == 0 || (coreml_model_path && cached_model_path != coreml_model_path)) {
-        if (coremlEncoder) {
-            closeModel(coremlEncoder);
+// Replace coreml compute with TensorRT while preserving signature
+static bool clip_image_encode_coreml(float * data, float * vec, const char* trt_engine_path) {
+    class L : public nvinfer1::ILogger {
+        void log(Severity s, nvinfer1::AsciiChar const* m) noexcept override {
+            if (s <= Severity::kINFO) fprintf(stdout, "[TRT] %s\n", reinterpret_cast<const char*>(m));
         }
-        coremlEncoder = loadModel(coreml_model_path);
-        if (!coremlEncoder) {
-            printf("Failed to load CoreML model from: %s\n", coreml_model_path ? coreml_model_path : "null");
+    };
+    static L logger;
+
+    static std::unique_ptr<nvinfer1::IRuntime, TrtDeleterGlobal<nvinfer1::IRuntime>> runtime;
+    static std::unique_ptr<nvinfer1::ICudaEngine, TrtDeleterGlobal<nvinfer1::ICudaEngine>> engine;
+    static std::unique_ptr<nvinfer1::IExecutionContext, TrtDeleterGlobal<nvinfer1::IExecutionContext>> context;
+    static std::string cached_path;
+    static int device_id = [](){ const char* env = std::getenv("MTMD_TRT_DEVICE"); return env ? std::atoi(env) : 0; }();
+
+    auto env_engine = std::getenv("MTMD_TRT_ENGINE");
+    const std::string cli_path = (trt_engine_path && std::string(trt_engine_path).size() > 0)
+        ? std::string(trt_engine_path)
+        : (env_engine ? std::string(env_engine) : std::string("/cache/caitianchi/code/v45/trt/out/vit_encoder_gpu1.plan"));
+
+    if (!runtime || cached_path != cli_path) {
+        // (Re)load engine
+        // ensure CUDA context is initialized on the selected device before TRT runtime
+        if (cudaSetDevice(device_id) != cudaSuccess) {
+            fprintf(stderr, "[TRT] cudaSetDevice(%d) failed before runtime creation\n", device_id);
             return false;
         }
-        cached_model_path = coreml_model_path ? coreml_model_path : "";
-        flag = 1;
+        cudaFree(0);
+        runtime.reset(nvinfer1::createInferRuntime(logger));
+        if (!runtime) return false;
+        const std::string path = cli_path;
+        std::ifstream f(path, std::ios::binary);
+        if (!f) { fprintf(stderr, "[TRT] Cannot open engine: %s\n", path.c_str()); return false; }
+        f.seekg(0, std::ios::end); size_t sz = (size_t)f.tellg(); f.seekg(0, std::ios::beg);
+        std::vector<char> blob(sz); f.read(blob.data(), sz);
+        engine.reset(runtime->deserializeCudaEngine(blob.data(), blob.size()));
+        if (!engine) return false;
+        context.reset(engine->createExecutionContext());
+        if (!context) return false;
+        cached_path = path;
     }
-    predictWith(coremlEncoder, data, vec);
+
+    // assume shape (1, 1024, 1152) and float32
+    const char* inputName = nullptr; const char* outputName = nullptr;
+    const int nb = engine->getNbIOTensors();
+    for (int i = 0; i < nb; ++i) {
+        const char* name = engine->getIOTensorName(i);
+        auto mode = engine->getTensorIOMode(name);
+        if (mode == nvinfer1::TensorIOMode::kINPUT) inputName = name;
+        else if (mode == nvinfer1::TensorIOMode::kOUTPUT) outputName = name;
+    }
+    if (!inputName || !outputName) return false;
+
+    // set input shape if dynamic
+    nvinfer1::Dims dims; dims.nbDims = 3; dims.d[0] = 1; dims.d[1] = 1024; dims.d[2] = 1152;
+    if (!context->setInputShape(inputName, dims)) return false;
+
+    size_t elems = (size_t)dims.d[0]*dims.d[1]*dims.d[2];
+    size_t bytes = elems * 4;
+
+    if (cudaSetDevice(device_id) != cudaSuccess) {
+        fprintf(stderr, "[TRT] cudaSetDevice(%d) failed\n", device_id);
+        return false;
+    }
+    void* dIn = nullptr; void* dOut = nullptr; cudaStream_t stream{}; cudaStreamCreate(&stream);
+    if (cudaMalloc(&dIn, bytes) != cudaSuccess || cudaMalloc(&dOut, bytes) != cudaSuccess) {
+        fprintf(stderr, "[TRT] cudaMalloc failed (bytes=%zu)\n", bytes);
+        if (stream) cudaStreamDestroy(stream);
+        if (dIn) cudaFree(dIn);
+        if (dOut) cudaFree(dOut);
+        return false;
+    }
+    context->setTensorAddress(inputName, dIn);
+    context->setTensorAddress(outputName, dOut);
+    if (cudaMemcpyAsync(dIn, data, bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+        fprintf(stderr, "[TRT] cudaMemcpyAsync H2D failed\n");
+        cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut); return false;
+    }
+    if (!context->enqueueV3(stream)) { fprintf(stderr, "[TRT] enqueueV3 failed\n"); cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut); return false; }
+    if (cudaMemcpyAsync(vec, dOut, bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+        fprintf(stderr, "[TRT] cudaMemcpyAsync D2H failed\n");
+        cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut); return false;
+    }
+    cudaStreamSynchronize(stream);
+    cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut);
     return true;
 }
 #endif
@@ -3873,18 +3959,24 @@ bool clip_image_encode(struct clip_ctx * ctx, const int n_threads, clip_image_f3
     *img_copy = *img;
     imgs.entries.push_back(std::move(img_copy));
 
-#if defined(ENABLE_COREML)
-    bool ios_ctx = true;
-    if (ios_ctx){
-        printf("clip use coreml\n");
-        std::vector<float> vit_embedding1(1100*1152);
-        std::vector<float> vit_embedding2(1100*1152);
+#if defined(ENABLE_TRT)
+    const char * use_trt_env = std::getenv("MTMD_USE_TRT");
+    bool trt_ctx = (use_trt_env == nullptr) || (std::string(use_trt_env) != "0");
+    if (trt_ctx){
+        printf("clip use trt\n");
+        std::vector<float> vit_embedding1(1024*1152);
+        std::vector<float> vit_embedding2(1024*1152);
 
         // call CoreML pipeline: embedding -> encoder -> resampler
         if (!coreml_embedding(ctx, n_threads, &imgs, vit_embedding1.data())) {
             return false;
         }
-        clip_image_encode_coreml(vit_embedding1.data(), vit_embedding2.data(), ctx->coreml_model_path.c_str());
+        // use TRT to replace core compute (function name preserved)
+        if (!clip_image_encode_coreml(vit_embedding1.data(), vit_embedding2.data(), ctx->trt_engine_path.c_str())) {
+            fprintf(stderr, "[TRT] inference failed; falling back to non-TRT path (set MTMD_USE_TRT=0 to disable)\n");
+            // Fallback to the standard path
+            return clip_image_batch_encode(ctx, n_threads, &imgs, vec);
+        }
         if (!coreml_resampler(ctx, n_threads, &imgs, vit_embedding2.data(), vec)) {
             return false;
         }
@@ -3895,7 +3987,7 @@ bool clip_image_encode(struct clip_ctx * ctx, const int n_threads, clip_image_f3
     return clip_image_batch_encode(ctx, n_threads, &imgs, vec);
 }
 
-#if defined(ENABLE_COREML)
+#if defined(ENABLE_TRT)
 static bool coreml_embedding(clip_ctx * ctx, const int n_threads, const clip_image_f32_batch * imgs_c_ptr, float * vec) {
     const clip_image_f32_batch & imgs = *imgs_c_ptr;
     int batch_size = imgs.entries.size();
@@ -4667,6 +4759,7 @@ void clip_image_f32_batch_add_mel(struct clip_image_f32_batch * batch, int n_mel
 
 void clip_set_coreml_model_path(struct clip_ctx * ctx, const char * coreml_model_path) {
     if (ctx && coreml_model_path) {
-        ctx->coreml_model_path = coreml_model_path;
+        // keep API stable; map to TRT engine path
+        ctx->trt_engine_path = coreml_model_path;
     }
 }

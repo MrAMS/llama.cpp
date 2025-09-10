@@ -4,6 +4,7 @@ find_package(Threads REQUIRED)
 
 # CoreML support option
 option(ENABLE_COREML "Enable CoreML support" OFF)
+option(ENABLE_TRT    "Enable TensorRT support" OFF)
 
 add_library(mtmd
             mtmd.cpp
@@ -30,6 +31,56 @@ if(ENABLE_COREML)
     # Enable ARC for Objective-C files
     set_source_files_properties(coreml/mtmd_coreml.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
     set_source_files_properties(coreml/ane_minicpmv4_vit_f16.m PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+endif()
+
+# TensorRT support (Linux)
+if(ENABLE_TRT)
+    # CUDA runtime
+    find_package(CUDAToolkit REQUIRED)
+
+    # Try to locate TensorRT headers and libs
+    find_path(TENSORRT_INCLUDE_DIR NvInfer.h
+        HINTS
+            ${TENSORRT_DIR}/include
+            $ENV{TENSORRT_DIR}/include
+            /usr/include
+            /usr/include/x86_64-linux-gnu
+            /usr/local/include
+            /usr/local/cuda/include)
+
+    find_library(NVINFER_LIBRARY nvinfer
+        HINTS
+            ${TENSORRT_DIR}/lib
+            ${TENSORRT_DIR}/lib64
+            $ENV{TENSORRT_DIR}/lib
+            $ENV{TENSORRT_DIR}/lib64
+            /usr/lib
+            /usr/lib/x86_64-linux-gnu
+            /usr/local/lib
+            /usr/local/lib64)
+
+    # Optional plugin lib (link if available)
+    find_library(NVINFER_PLUGIN_LIBRARY nvinfer_plugin
+        HINTS
+            ${TENSORRT_DIR}/lib
+            ${TENSORRT_DIR}/lib64
+            $ENV{TENSORRT_DIR}/lib
+            $ENV{TENSORRT_DIR}/lib64
+            /usr/lib
+            /usr/lib/x86_64-linux-gnu
+            /usr/local/lib
+            /usr/local/lib64)
+
+    if(NOT TENSORRT_INCLUDE_DIR OR NOT NVINFER_LIBRARY)
+        message(FATAL_ERROR "TensorRT not found. Set TENSORRT_DIR or specify TENSORRT_INCLUDE_DIR and NVINFER_LIBRARY.")
+    endif()
+
+    target_include_directories(mtmd PRIVATE ${TENSORRT_INCLUDE_DIR})
+    target_link_libraries(mtmd PRIVATE ${NVINFER_LIBRARY} CUDA::cudart)
+    if(NVINFER_PLUGIN_LIBRARY)
+        target_link_libraries(mtmd PRIVATE ${NVINFER_PLUGIN_LIBRARY})
+    endif()
+    target_compile_definitions(mtmd PRIVATE ENABLE_TRT)
 endif()
 
 target_link_libraries     (mtmd PUBLIC ggml llama common)

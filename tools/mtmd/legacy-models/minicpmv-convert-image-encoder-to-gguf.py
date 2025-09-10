@@ -607,6 +607,9 @@ else:
     elif minicpmv_version == 5:
         emb_dim = 2560
         block_count = 27
+    elif minicpmv_version == 6:
+        emb_dim = 4096
+        block_count = 27
 
     default_vision_config = {
             "hidden_size": 1152,
@@ -627,6 +630,10 @@ elif minicpmv_version == 4:
     vision_config = SiglipVisionConfig(**default_vision_config)
     model = SiglipVisionTransformer(vision_config)
 elif minicpmv_version == 5:
+    default_vision_config["model_type"] = "siglip_vision_model"
+    vision_config = SiglipVisionConfig(**default_vision_config)
+    model = SiglipVisionTransformer(vision_config)
+elif minicpmv_version == 6:
     default_vision_config["model_type"] = "siglip_vision_model"
     vision_config = SiglipVisionConfig(**default_vision_config)
     model = SiglipVisionTransformer(vision_config)
@@ -824,17 +831,13 @@ def _replace_name(s, v):
     if re.match("vision_model.embeddings.position_embedding", s):
         v = v.unsqueeze(0)
         return {s: v}
-    print(s)
-    if "emb" in s:
-        return {s: v}
-    return None
+
+    return {s: v}
 
 state_dict = model.state_dict()
 new_state_dict = {}
 for k, v in state_dict.items():
     kvs = _replace_name(k, v)
-    if kvs is None:
-        continue
     for nk, nv in kvs.items():
         new_state_dict[nk] = nv
 state_dict = new_state_dict
