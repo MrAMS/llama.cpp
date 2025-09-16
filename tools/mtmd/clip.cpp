@@ -35,6 +35,7 @@
 #include <limits>
 #include <array>
 #include <numeric>
+#include <chrono>
 #include <functional>
 
 struct clip_logger_state g_logger_state = {GGML_LOG_LEVEL_CONT, clip_log_callback_default, NULL};
@@ -2257,6 +2258,8 @@ struct clip_model_loader {
                         hparams.minicpmv_query_num = 64;
                     } else if (hparams.minicpmv_version == 6) {
                         hparams.minicpmv_query_num = 64;
+                    } else if (hparams.minicpmv_version == 7) {
+                        hparams.minicpmv_query_num = 64;
                     } else {
                         hparams.minicpmv_query_num = 96;
                     }
@@ -3695,6 +3698,8 @@ int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * im
                         n_patches_sq = 64;
                     } else if (params.minicpmv_version == 6) {
                         n_patches_sq = 64;
+                    } else if (params.minicpmv_version == 7) {
+                        n_patches_sq = 64;
                     } else {
                         GGML_ABORT("Unknown minicpmv version");
                     }
@@ -3864,54 +3869,97 @@ struct TrtDeleterGlobal {
 static bool coreml_embedding(clip_ctx * ctx, const int n_threads, const clip_image_f32_batch * imgs_c_ptr, float * vec);
 static bool coreml_resampler(clip_ctx * ctx, const int n_threads, const clip_image_f32_batch * imgs_c_ptr, const float * vit_embedding, float * vec);
 
-// Replace coreml compute with TensorRT while preserving signature
-static bool clip_image_encode_coreml(float * data, float * vec, const char* trt_engine_path) {
-    class L : public nvinfer1::ILogger {
-        void log(Severity s, nvinfer1::AsciiChar const* m) noexcept override {
-            if (s <= Severity::kINFO) fprintf(stdout, "[TRT] %s\n", reinterpret_cast<const char*>(m));
-        }
-    };
-    static L logger;
+// TRT引擎全局状态
+#if defined(ENABLE_TRT)
+class TrtLogger : public nvinfer1::ILogger {
+    void log(Severity s, nvinfer1::AsciiChar const* m) noexcept override {
+        if (s <= Severity::kINFO) fprintf(stdout, "[TRT] %s\n", reinterpret_cast<const char*>(m));
+    }
+};
 
-    static std::unique_ptr<nvinfer1::IRuntime, TrtDeleterGlobal<nvinfer1::IRuntime>> runtime;
-    static std::unique_ptr<nvinfer1::ICudaEngine, TrtDeleterGlobal<nvinfer1::ICudaEngine>> engine;
-    static std::unique_ptr<nvinfer1::IExecutionContext, TrtDeleterGlobal<nvinfer1::IExecutionContext>> context;
-    static std::string cached_path;
-    static int device_id = [](){ const char* env = std::getenv("MTMD_TRT_DEVICE"); return env ? std::atoi(env) : 0; }();
+// 使用裸指针避免智能指针的自动析构，让操作系统清理资源
+static TrtLogger g_trt_logger;
+static nvinfer1::IRuntime* g_trt_runtime = nullptr;
+static nvinfer1::ICudaEngine* g_trt_engine = nullptr;
+static nvinfer1::IExecutionContext* g_trt_context = nullptr;
+static std::string g_trt_cached_path;
+static int g_trt_device_id = [](){ const char* env = std::getenv("MTMD_TRT_DEVICE"); return env ? std::atoi(env) : 0; }();
 
+// 注意：使用裸指针避免程序退出时的自动析构导致CUDA驱动关闭错误
+// 资源会由操作系统自动清理，这在程序退出时是安全且正确的做法
+#endif
+
+// TRT引擎预加载函数声明
+static bool trt_engine_preload(const char* trt_engine_path = nullptr);
+
+
+
+// TRT引擎加载的内部实现
+static bool trt_engine_load_internal(const char* trt_engine_path) {
+#if defined(ENABLE_TRT)
     auto env_engine = std::getenv("MTMD_TRT_ENGINE");
     const std::string cli_path = (trt_engine_path && std::string(trt_engine_path).size() > 0)
         ? std::string(trt_engine_path)
-        : (env_engine ? std::string(env_engine) : std::string("/cache/caitianchi/code/v45/trt/out/vit_encoder_gpu1.plan"));
+        : (env_engine ? std::string(env_engine) : std::string("/home/modelbest/workspace/caitianchi/model/MiniCPM-V-4-trt/vit_encoder_orin.plan"));
 
-    if (!runtime || cached_path != cli_path) {
-        // (Re)load engine
+    if (!g_trt_runtime || g_trt_cached_path != cli_path) {
+        printf("[TRT] Loading TensorRT engine from: %s\n", cli_path.c_str());
+        auto start_time = std::chrono::high_resolution_clock::now();
+        
         // ensure CUDA context is initialized on the selected device before TRT runtime
-        if (cudaSetDevice(device_id) != cudaSuccess) {
-            fprintf(stderr, "[TRT] cudaSetDevice(%d) failed before runtime creation\n", device_id);
+        if (cudaSetDevice(g_trt_device_id) != cudaSuccess) {
+            fprintf(stderr, "[TRT] cudaSetDevice(%d) failed before runtime creation\n", g_trt_device_id);
             return false;
         }
         cudaFree(0);
-        runtime.reset(nvinfer1::createInferRuntime(logger));
-        if (!runtime) return false;
+        g_trt_runtime = nvinfer1::createInferRuntime(g_trt_logger);
+        if (!g_trt_runtime) return false;
         const std::string path = cli_path;
         std::ifstream f(path, std::ios::binary);
         if (!f) { fprintf(stderr, "[TRT] Cannot open engine: %s\n", path.c_str()); return false; }
+        printf("[TRT] Loaded engine size: ");
         f.seekg(0, std::ios::end); size_t sz = (size_t)f.tellg(); f.seekg(0, std::ios::beg);
+        printf("%.0f MiB\n", sz / 1048576.0);
         std::vector<char> blob(sz); f.read(blob.data(), sz);
-        engine.reset(runtime->deserializeCudaEngine(blob.data(), blob.size()));
-        if (!engine) return false;
-        context.reset(engine->createExecutionContext());
-        if (!context) return false;
-        cached_path = path;
+        g_trt_engine = g_trt_runtime->deserializeCudaEngine(blob.data(), blob.size());
+        if (!g_trt_engine) return false;
+        g_trt_context = g_trt_engine->createExecutionContext();
+        if (!g_trt_context) return false;
+        g_trt_cached_path = path;
+        
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+        printf("[TRT] Engine loaded successfully in %ld ms\n", duration.count());
+    } else {
+        printf("[TRT] Engine already loaded, reusing cached engine\n");
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+// TRT引擎预加载函数实现
+static bool trt_engine_preload(const char* trt_engine_path) {
+    printf("[TRT] Preloading TensorRT engine...\n");
+    return trt_engine_load_internal(trt_engine_path);
+}
+#endif
+
+// Replace coreml compute with TensorRT while preserving signature
+static bool clip_image_encode_coreml(float * data, float * vec, const char* trt_engine_path) {
+#if defined(ENABLE_TRT)
+    // 使用内部加载函数确保引擎已加载（懒加载）
+    if (!trt_engine_load_internal(trt_engine_path)) {
+        return false;
     }
 
     // assume shape (1, 1024, 1152) and float32
     const char* inputName = nullptr; const char* outputName = nullptr;
-    const int nb = engine->getNbIOTensors();
+    const int nb = g_trt_engine->getNbIOTensors();
     for (int i = 0; i < nb; ++i) {
-        const char* name = engine->getIOTensorName(i);
-        auto mode = engine->getTensorIOMode(name);
+        const char* name = g_trt_engine->getIOTensorName(i);
+        auto mode = g_trt_engine->getTensorIOMode(name);
         if (mode == nvinfer1::TensorIOMode::kINPUT) inputName = name;
         else if (mode == nvinfer1::TensorIOMode::kOUTPUT) outputName = name;
     }
@@ -3919,13 +3967,13 @@ static bool clip_image_encode_coreml(float * data, float * vec, const char* trt_
 
     // set input shape if dynamic
     nvinfer1::Dims dims; dims.nbDims = 3; dims.d[0] = 1; dims.d[1] = 1024; dims.d[2] = 1152;
-    if (!context->setInputShape(inputName, dims)) return false;
+    if (!g_trt_context->setInputShape(inputName, dims)) return false;
 
     size_t elems = (size_t)dims.d[0]*dims.d[1]*dims.d[2];
     size_t bytes = elems * 4;
 
-    if (cudaSetDevice(device_id) != cudaSuccess) {
-        fprintf(stderr, "[TRT] cudaSetDevice(%d) failed\n", device_id);
+    if (cudaSetDevice(g_trt_device_id) != cudaSuccess) {
+        fprintf(stderr, "[TRT] cudaSetDevice(%d) failed\n", g_trt_device_id);
         return false;
     }
     void* dIn = nullptr; void* dOut = nullptr; cudaStream_t stream{}; cudaStreamCreate(&stream);
@@ -3936,13 +3984,13 @@ static bool clip_image_encode_coreml(float * data, float * vec, const char* trt_
         if (dOut) cudaFree(dOut);
         return false;
     }
-    context->setTensorAddress(inputName, dIn);
-    context->setTensorAddress(outputName, dOut);
+    g_trt_context->setTensorAddress(inputName, dIn);
+    g_trt_context->setTensorAddress(outputName, dOut);
     if (cudaMemcpyAsync(dIn, data, bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
         fprintf(stderr, "[TRT] cudaMemcpyAsync H2D failed\n");
         cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut); return false;
     }
-    if (!context->enqueueV3(stream)) { fprintf(stderr, "[TRT] enqueueV3 failed\n"); cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut); return false; }
+    if (!g_trt_context->enqueueV3(stream)) { fprintf(stderr, "[TRT] enqueueV3 failed\n"); cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut); return false; }
     if (cudaMemcpyAsync(vec, dOut, bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
         fprintf(stderr, "[TRT] cudaMemcpyAsync D2H failed\n");
         cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut); return false;
@@ -3950,8 +3998,10 @@ static bool clip_image_encode_coreml(float * data, float * vec, const char* trt_
     cudaStreamSynchronize(stream);
     cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut);
     return true;
-}
+#else
+    return false;  // TensorRT not enabled
 #endif
+}
 
 bool clip_image_encode(struct clip_ctx * ctx, const int n_threads, clip_image_f32 * img, float * vec) {
     clip_image_f32_batch imgs;
@@ -4762,4 +4812,49 @@ void clip_set_coreml_model_path(struct clip_ctx * ctx, const char * coreml_model
         // keep API stable; map to TRT engine path
         ctx->trt_engine_path = coreml_model_path;
     }
+}
+
+bool clip_trt_preload_engine(const char * engine_path) {
+    printf("[TRT] Manual preload requested for engine: %s\n", engine_path ? engine_path : "default");
+    return trt_engine_preload(engine_path);
+}
+
+void clip_trt_cleanup_engine() {
+#if defined(ENABLE_TRT)
+    printf("[TRT] Manual cleanup requested\n");
+    try {
+        // 按正确顺序清理资源
+        if (g_trt_context) {
+#if defined(NV_TENSORRT_MAJOR) && (NV_TENSORRT_MAJOR >= 10)
+            delete g_trt_context;
+#else
+            g_trt_context->destroy();
+#endif
+            g_trt_context = nullptr;
+            printf("[TRT] Execution context released\n");
+        }
+        if (g_trt_engine) {
+#if defined(NV_TENSORRT_MAJOR) && (NV_TENSORRT_MAJOR >= 10)
+            delete g_trt_engine;
+#else
+            g_trt_engine->destroy();
+#endif
+            g_trt_engine = nullptr;
+            printf("[TRT] Engine released\n");
+        }
+        if (g_trt_runtime) {
+#if defined(NV_TENSORRT_MAJOR) && (NV_TENSORRT_MAJOR >= 10)
+            delete g_trt_runtime;
+#else
+            g_trt_runtime->destroy();
+#endif
+            g_trt_runtime = nullptr;
+            printf("[TRT] Runtime released\n");
+        }
+    } catch (...) {
+        printf("[TRT] Exception during manual cleanup (ignored)\n");
+    }
+#else
+    printf("[TRT] TensorRT not enabled, nothing to cleanup\n");
+#endif
 }

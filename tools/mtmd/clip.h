@@ -95,6 +95,20 @@ struct ggml_tensor * clip_get_newline_tensor(const struct clip_ctx * ctx);
 bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, struct clip_image_f32 * img, float * vec);
 bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct clip_image_f32_batch * imgs, float * vec);
 
+/** 
+ * Preload TensorRT engine if ENABLE_TRT is defined.
+ * This can be called early to avoid the loading delay during first inference.
+ * Returns true if TRT is enabled and engine was loaded successfully, false otherwise.
+ */
+bool clip_trt_preload_engine(const char * engine_path);
+
+/**
+ * Manually cleanup TensorRT resources if ENABLE_TRT is defined.
+ * This is optional - the OS will cleanup resources automatically on program exit.
+ * Only call this if you need to explicitly free TRT resources before program end.
+ */
+void clip_trt_cleanup_engine();
+
 int clip_is_minicpmv(const struct clip_ctx * ctx);
 bool clip_is_glm(const struct clip_ctx * ctx);
 bool clip_is_qwen2vl(const struct clip_ctx * ctx);
