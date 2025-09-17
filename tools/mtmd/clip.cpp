@@ -3947,14 +3947,16 @@ static bool trt_engine_preload(const char* trt_engine_path) {
 #endif
 
 // Replace coreml compute with TensorRT while preserving signature
-static bool clip_image_encode_coreml(float * data, float * vec, const char* trt_engine_path) {
+static bool clip_image_encode_coreml(float * data, float * vec, const char* trt_engine_path, int actual_dim0 = 1100) {
 #if defined(ENABLE_TRT)
-    // 使用内部加载函数确保引擎已加载（懒加载）
     if (!trt_engine_load_internal(trt_engine_path)) {
         return false;
     }
 
-    // assume shape (1, 1024, 1152) and float32
+    const int trt_dim0 = 1024;
+    const int trt_dim1 = 1152;
+    const int trt_dim2 = 1;
+    
     const char* inputName = nullptr; const char* outputName = nullptr;
     const int nb = g_trt_engine->getNbIOTensors();
     for (int i = 0; i < nb; ++i) {
@@ -3966,37 +3968,72 @@ static bool clip_image_encode_coreml(float * data, float * vec, const char* trt_
     if (!inputName || !outputName) return false;
 
     // set input shape if dynamic
-    nvinfer1::Dims dims; dims.nbDims = 3; dims.d[0] = 1; dims.d[1] = 1024; dims.d[2] = 1152;
+    nvinfer1::Dims dims; dims.nbDims = 3; dims.d[0] = trt_dim2; dims.d[1] = trt_dim0; dims.d[2] = trt_dim1;
     if (!g_trt_context->setInputShape(inputName, dims)) return false;
 
-    size_t elems = (size_t)dims.d[0]*dims.d[1]*dims.d[2];
-    size_t bytes = elems * 4;
+    const size_t trt_elems = (size_t)trt_dim2 * trt_dim0 * trt_dim1;
+    const size_t trt_bytes = trt_elems * 4;
+    const size_t actual_elems = (size_t)1 * actual_dim0 * trt_dim1;
 
     if (cudaSetDevice(g_trt_device_id) != cudaSuccess) {
         fprintf(stderr, "[TRT] cudaSetDevice(%d) failed\n", g_trt_device_id);
         return false;
     }
+    
     void* dIn = nullptr; void* dOut = nullptr; cudaStream_t stream{}; cudaStreamCreate(&stream);
-    if (cudaMalloc(&dIn, bytes) != cudaSuccess || cudaMalloc(&dOut, bytes) != cudaSuccess) {
-        fprintf(stderr, "[TRT] cudaMalloc failed (bytes=%zu)\n", bytes);
+    if (cudaMalloc(&dIn, trt_bytes) != cudaSuccess || cudaMalloc(&dOut, trt_bytes) != cudaSuccess) {
+        fprintf(stderr, "[TRT] cudaMalloc failed (bytes=%zu)\n", trt_bytes);
         if (stream) cudaStreamDestroy(stream);
         if (dIn) cudaFree(dIn);
         if (dOut) cudaFree(dOut);
         return false;
     }
+    
     g_trt_context->setTensorAddress(inputName, dIn);
     g_trt_context->setTensorAddress(outputName, dOut);
-    if (cudaMemcpyAsync(dIn, data, bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+    
+    std::vector<float> trt_input(trt_elems, 0.0f);
+    
+    if (actual_dim0 <= trt_dim0) {
+        std::memcpy(trt_input.data(), data, actual_elems * sizeof(float));
+    } else {
+        for (int i = 0; i < trt_dim1; ++i) {
+            std::memcpy(trt_input.data() + i * trt_dim0, 
+                       data + i * actual_dim0, 
+                       trt_dim0 * sizeof(float));
+        }
+    }
+    
+    if (cudaMemcpyAsync(dIn, trt_input.data(), trt_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
         fprintf(stderr, "[TRT] cudaMemcpyAsync H2D failed\n");
         cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut); return false;
     }
-    if (!g_trt_context->enqueueV3(stream)) { fprintf(stderr, "[TRT] enqueueV3 failed\n"); cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut); return false; }
-    if (cudaMemcpyAsync(vec, dOut, bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+    
+    if (!g_trt_context->enqueueV3(stream)) { 
+        fprintf(stderr, "[TRT] enqueueV3 failed\n"); 
+        cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut); return false; 
+    }
+    
+    std::vector<float> trt_output(trt_elems);
+    if (cudaMemcpyAsync(trt_output.data(), dOut, trt_bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
         fprintf(stderr, "[TRT] cudaMemcpyAsync D2H failed\n");
         cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut); return false;
     }
+    
     cudaStreamSynchronize(stream);
     cudaStreamDestroy(stream); cudaFree(dIn); cudaFree(dOut);
+    
+    if (actual_dim0 <= trt_dim0) {
+        std::memcpy(vec, trt_output.data(), actual_elems * sizeof(float));
+    } else {
+        std::memset(vec, 0, actual_elems * sizeof(float));
+        for (int i = 0; i < trt_dim1; ++i) {
+            std::memcpy(vec + i * actual_dim0,
+                       trt_output.data() + i * trt_dim0,
+                       trt_dim0 * sizeof(float));
+        }
+    }
+    
     return true;
 #else
     return false;  // TensorRT not enabled
@@ -4014,15 +4051,15 @@ bool clip_image_encode(struct clip_ctx * ctx, const int n_threads, clip_image_f3
     bool trt_ctx = (use_trt_env == nullptr) || (std::string(use_trt_env) != "0");
     if (trt_ctx){
         printf("clip use trt\n");
-        std::vector<float> vit_embedding1(1024*1152);
-        std::vector<float> vit_embedding2(1024*1152);
+        std::vector<float> vit_embedding1(1100*1152);
+        std::vector<float> vit_embedding2(1100*1152);
 
         // call CoreML pipeline: embedding -> encoder -> resampler
         if (!coreml_embedding(ctx, n_threads, &imgs, vit_embedding1.data())) {
             return false;
         }
         // use TRT to replace core compute (function name preserved)
-        if (!clip_image_encode_coreml(vit_embedding1.data(), vit_embedding2.data(), ctx->trt_engine_path.c_str())) {
+        if (!clip_image_encode_coreml(vit_embedding1.data(), vit_embedding2.data(), ctx->trt_engine_path.c_str(), 1100)) {
             fprintf(stderr, "[TRT] inference failed; falling back to non-TRT path (set MTMD_USE_TRT=0 to disable)\n");
             // Fallback to the standard path
             return clip_image_batch_encode(ctx, n_threads, &imgs, vec);
