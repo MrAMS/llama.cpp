@@ -5192,6 +5192,139 @@ int main(int argc, char ** argv) {
         res_ok(res, {{ "prompt", std::move(data.at("prompt")) }});
     };
 
+    //
+    // Streaming endpoints - POST /v1/stream/prefill | /v1/stream/decode | /v1/stream/omni_init
+    //
+    // NOTE:
+    //  Request bodies follow the semantics used in omni minicpmo flow.
+    //  Internal implementation is intentionally left blank per request; handlers validate inputs shape only.
+    //  Replace placeholders with actual invocation to streaming backend when ready.
+
+    // impl: prefill
+    const auto handle_stream_prefill_impl = [&res_ok, &res_error](const json & data, httplib::Response & res) -> void {
+        // Expected body fields (aligned with test_case in minicpmo-cli.cpp):
+        //  audio_path_prefix: string (required)
+        //  img_path_prefix: string (optional, default "")
+        //  img_posfix: string (optional, default "")
+        //  cnt: integer (required)
+        if (!data.contains("audio_path_prefix") || !data.at("audio_path_prefix").is_string()) {
+            res_error(res, format_error_response("\"audio_path_prefix\" must be provided as string", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+        if (!data.contains("cnt") || !data.at("cnt").is_number_integer()) {
+            res_error(res, format_error_response("\"cnt\" must be provided as integer", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        // Placeholder only. Replace with actual streaming calls when available.
+        //
+        // static omni_context * ctx_omni = nullptr; // retained across requests
+        // const std::string audio_path_prefix = data.at("audio_path_prefix");
+        // const std::string img_path_prefix   = data.value("img_path_prefix", "");
+        // const std::string img_posfix        = data.value("img_posfix", "");
+        // const int cnt                        = data.at("cnt");
+        // for (int il = 0; il < cnt; ++il) {
+        //     std::string aud_fname = audio_path_prefix + std::to_string(il) + ".wav";
+        //     std::string img_fname;
+        //     if (!img_path_prefix.empty()) {
+        //         img_fname = img_path_prefix + std::to_string(il) + img_posfix;
+        //     }
+        //     // Calls the prefill with 1 index as in cli test_case
+        //     stream_prefill(ctx_omni, aud_fname, img_fname, il + 1);
+        // }
+
+        json ack = {
+            {"success", true},
+            {"audio_path_prefix", data.at("audio_path_prefix")},
+            {"img_path_prefix", data.contains("img_path_prefix") ? data.at("img_path_prefix") : json("")},
+            {"img_posfix", data.contains("img_posfix") ? data.at("img_posfix") : json("")},
+            {"cnt", data.at("cnt")}
+        };
+        res_ok(res, ack);
+    };
+
+    // wrapper: prefill
+    const auto handle_stream_prefill = [&handle_stream_prefill_impl](const httplib::Request & req, httplib::Response & res) {
+        SRV_INF("102\n");
+        json body = json::parse(req.body);
+        handle_stream_prefill_impl(body, res);
+    };
+
+    // impl: decode
+    const auto handle_stream_decode_impl = [&res_ok, &res_error](const json & data, httplib::Response & res) -> void {
+        // Expected body fields:
+        // Placeholder only. Replace with actual streaming calls when available.
+        //
+        // static omni_context * ctx_omni = nullptr; // retained across requests
+        // const int decode_num = data.value("decode_num", 1);
+        // // Decode loop (text-only termination): keep calling in chunks of `decode_num`
+        // //    const int max_tgt_len = ctx_omni->params->n_predict < 0 ? ctx_omni->params->n_ctx : ctx_omni->params->n_predict;
+        // //    for (int il = 0; il < max_tgt_len; ) accumulate by step size jl (il += jl)
+        // // const int max_tgt_len = ctx_omni->params->n_predict < 0 ? ctx_omni->params->n_ctx : ctx_omni->params->n_predict;
+        // // bool llm_finish = false;
+        // // for (int il = 0; il < max_tgt_len && !llm_finish; ) {
+        // //     // Perform one decode chunk of `decode_num` tokens
+        // //     // stream_decode should advance internal state by up to `decode_num` steps
+        // //     // and return information about steps taken and whether a stop marker was hit.
+        // //     // Example if stream_decode returns a struct:
+        // //     // auto res = stream_decode(ctx_omni, decode_num);
+        // //     // llm_finish |= res.llm_finish;  // true if <|eos|> or </s> or <|listen|> observed
+        // //     // int jl = res.jl;              // number of steps advanced (<= decode_num)
+        // //     // il += jl;
+        // //     // if (llm_finish) break;
+        // // }
+
+        int decode_num = 1;
+        if (data.contains("decode_num")) {
+            if (!data.at("decode_num").is_number_integer()) {
+                res_error(res, format_error_response("\"decode_num\" must be an integer", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            decode_num = data.at("decode_num");
+        }
+
+        json ack = {
+            {"success", true},
+            {"decode_num", decode_num}
+        };
+        res_ok(res, ack);
+    };
+
+    const auto handle_stream_decode = [&handle_stream_decode_impl](const httplib::Request & req, httplib::Response & res) {
+        SRV_INF("103\n");
+        json body = json::parse(req.body);
+        handle_stream_decode_impl(body, res);
+    };
+
+    // impl: omni_init
+    const auto handle_stream_omni_init_impl = [&res_ok, &res_error, &params](const json & data, httplib::Response & res) -> void {
+        // Expected body fields (aligned with omni_init):
+        if (!data.contains("media_type") || !data.at("media_type").is_number_integer()) {
+            res_error(res, format_error_response("\"media_type\" must be provided as integer", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        // Placeholder only. Replace with actual streaming calls when available.
+        // static omni_context * ctx_omni = nullptr; // retained across requests
+        // int media_type = data.at("media_type");
+        // // Initialize omni runtime context; reuse global/common params
+        // ctx_omni = omni_init(&params, media_type);
+        // ctx_omni->async = true; // optional, if async streaming is desired，follow the same things in minicpmo-cli.cpp
+
+        json ack = {
+            {"success", true},
+            {"media_type", data.at("media_type")},
+            {"params_present", data.contains("params")}
+        };
+        res_ok(res, ack);
+    };
+
+    const auto handle_stream_omni_init = [&handle_stream_omni_init_impl](const httplib::Request & req, httplib::Response & res) {
+        SRV_INF("101\n");
+        json body = json::parse(req.body);
+        handle_stream_omni_init_impl(body, res);
+    };
+
     const auto handle_models = [&params, &ctx_server, &state, &res_ok](const httplib::Request &, httplib::Response & res) {
         server_state current_state = state.load();
         json model_meta = nullptr;
@@ -5599,6 +5732,10 @@ int main(int argc, char ** argv) {
     svr->Post(params.api_prefix + "/tokenize",            handle_tokenize);
     svr->Post(params.api_prefix + "/detokenize",          handle_detokenize);
     svr->Post(params.api_prefix + "/apply-template",      handle_apply_template);
+    // Streaming 
+    svr->Post(params.api_prefix + "/v1/stream/prefill",    handle_stream_prefill);
+    svr->Post(params.api_prefix + "/v1/stream/decode",     handle_stream_decode);
+    svr->Post(params.api_prefix + "/v1/stream/omni_init",  handle_stream_omni_init);
     // LoRA adapters hotswap
     svr->Get (params.api_prefix + "/lora-adapters",       handle_lora_adapters_list);
     svr->Post(params.api_prefix + "/lora-adapters",       handle_lora_adapters_apply);
